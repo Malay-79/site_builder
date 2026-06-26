@@ -327,7 +327,9 @@ export const purchaseCredits = async (req, res) => {
                 credits: plan.credits
             }
         });
-        const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+        const stripeKey = process.env.STRIPE_SECRET_KEY;
+        console.log(`🔑 Using Stripe key starting with: ${stripeKey.substring(0, 20)}...`);
+        const stripe = new Stripe(stripeKey);
         const session = await stripe.checkout.sessions.create({
             success_url: `${origin}/loading`,
             cancel_url: `${origin}`,
@@ -350,6 +352,8 @@ export const purchaseCredits = async (req, res) => {
             },
             expires_at: Math.floor(Date.now() / 1000) + 30 * 60, // Expires in 30 minutes
         });
+        console.log(`✅ Checkout session created: ${session.id}`);
+        console.log(`🔗 Session URL: ${session.url}`);
         res.json({ payment_link: session.url });
     }
     catch (error) {

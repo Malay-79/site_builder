@@ -1,6 +1,21 @@
 import prisma from '../lib/prisma.js';
-import openai from '../configs/openai.js';
+import { createChatCompletionWithRetry } from '../configs/openai.js';
 import Stripe from 'stripe';
+export const extractHTML = (content) => {
+    if (!content)
+        return "";
+    // Try to find the HTML document
+    const htmlStart = content.search(/<!DOCTYPE\s+html|<html/i);
+    const htmlEnd = content.lastIndexOf("</html>");
+    if (htmlStart !== -1 && htmlEnd !== -1) {
+        return content.substring(htmlStart, htmlEnd + 7).trim();
+    }
+    // Fallback: strip markdown code blocks
+    return content
+        .replace(/```[a-z]*\n?/gi, '')
+        .replace(/```$/g, '')
+        .trim();
+};
 // Get User Credits
 export const getUserCredits = async (req, res) => {
     try {
@@ -30,7 +45,7 @@ export const createUserProject = async (req, res) => {
         const user = await prisma.user.findUnique({
             where: { id: userId }
         });
-        if (user && user.credits < 5) {
+        if (user && user.credits < 2) {
             return res.status(403).json({ message: 'add credits to create more projects' });
         }
         // Create a new project
@@ -56,12 +71,16 @@ export const createUserProject = async (req, res) => {
         });
         await prisma.user.update({
             where: { id: userId },
-            data: { credits: { decrement: 5 } }
+            data: { credits: { decrement: 2 } }
         });
         res.json({ projectId: project.id });
         // Enhance user prompt
-        const promptEnhanceResponse = await openai.chat.completions.create({
-            model: process.env.AI_MODEL || 'google/gemma-4-31b-it:free',
+        console.log("AI prompt enhancement request started.");
+        console.log("Model requested:", process.env.AI_MODEL || 'kwaipilot/kat-coder-pro-v2');
+        console.log("Initial prompt payload:", initial_prompt);
+        const promptEnhanceResponse = await createChatCompletionWithRetry({
+            model: process.env.AI_MODEL || 'kwaipilot/kat-coder-pro-v2',
+            max_tokens: 1500,
             messages: [
                 {
                     role: 'system',
@@ -84,6 +103,7 @@ export const createUserProject = async (req, res) => {
                 }
             ]
         });
+        console.log("AI prompt enhancement response received:", JSON.stringify(promptEnhanceResponse, null, 2));
         const enhancedPrompt = promptEnhanceResponse.choices[0].message.content;
         await prisma.conversation.create({
             data: {
@@ -100,8 +120,16 @@ export const createUserProject = async (req, res) => {
             }
         });
         // Generate website code
-        const codeGenerationResponse = await openai.chat.completions.create({
-            model: process.env.AI_MODEL || 'google/gemma-4-31b-it:free',
+        console.log("AI code generation request started.");
+        console.log("Model requested:", process.env.AI_MODEL || 'kwaipilot/kat-coder-pro-v2');
+        console.log("Enhanced prompt payload:", enhancedPrompt);
+        // Calculate max_tokens dynamically: scale based on prompt length, capped between 1500 and 2500
+        const promptLength = (enhancedPrompt || '').length;
+        const dynamicMaxTokens = Math.min(2500, Math.max(1500, 1500 + Math.floor(promptLength * 0.5)));
+        console.log(`[Dynamic Token Allocation] Calculated max_tokens: ${dynamicMaxTokens} for prompt of length ${promptLength}`);
+        const codeGenerationResponse = await createChatCompletionWithRetry({
+            model: process.env.AI_MODEL || 'kwaipilot/kat-coder-pro-v2',
+            max_tokens: dynamicMaxTokens,
             messages: [
                 {
                     role: 'system',
@@ -137,8 +165,13 @@ export const createUserProject = async (req, res) => {
                 }
             ]
         });
-        const code = codeGenerationResponse.choices[0].message.content || '';
-        if (!code) {
+        console.log("=== RAW AI RESPONSE ===");
+        console.log(codeGenerationResponse?.choices?.[0]?.message?.content || "(null/undefined)");
+        const rawCode = codeGenerationResponse?.choices?.[0]?.message?.content || '';
+        const processedCode = extractHTML(rawCode);
+        console.log("=== PROCESSED/PARSING OUTPUT ===");
+        console.log(processedCode);
+        if (!processedCode) {
             await prisma.conversation.create({
                 data: {
                     role: 'assistant',
@@ -148,20 +181,20 @@ export const createUserProject = async (req, res) => {
             });
             await prisma.user.update({
                 where: { id: userId },
-                data: { credits: { increment: 5 } }
+                data: { credits: { increment: 2 } }
             });
             return;
         }
         // Create Version for the project
         const version = await prisma.version.create({
             data: {
-                code: code.replace(/```[a-z]*\n?/gi, '')
-                    .replace(/```$/g, '')
-                    .trim(),
+                code: processedCode,
                 description: 'Initial version',
                 projectId: project.id
             }
         });
+        console.log("=== DATABASE-STORED CONTENT (VERSION ID: " + version.id + ") ===");
+        console.log(version.code);
         await prisma.conversation.create({
             data: {
                 role: 'assistant',
@@ -169,15 +202,15 @@ export const createUserProject = async (req, res) => {
                 projectId: project.id
             }
         });
-        await prisma.websiteProject.update({
+        const updatedProject = await prisma.websiteProject.update({
             where: { id: project.id },
             data: {
-                current_code: code.replace(/```[a-z]*\n?/gi, '')
-                    .replace(/```$/g, '')
-                    .trim(),
+                current_code: processedCode,
                 current_version_index: version.id
             }
         });
+        console.log("=== DATABASE-STORED CONTENT (PROJECT ID: " + updatedProject.id + ") ===");
+        console.log(updatedProject.current_code);
     }
     catch (error) {
         console.log('Error in createUserProject:', error);
@@ -185,7 +218,7 @@ export const createUserProject = async (req, res) => {
         if (userId) {
             await prisma.user.update({
                 where: { id: userId },
-                data: { credits: { increment: 5 } }
+                data: { credits: { increment: 2 } }
             }).catch(e => console.log('Failed to refund credits:', e));
         }
         // If the response was already sent (project created but AI failed),

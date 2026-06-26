@@ -1,5 +1,20 @@
 import prisma from '../lib/prisma.js';
-import openai from '../configs/openai.js';
+import { createChatCompletionWithRetry } from '../configs/openai.js';
+export const extractHTML = (content) => {
+    if (!content)
+        return "";
+    // Try to find the HTML document
+    const htmlStart = content.search(/<!DOCTYPE\s+html|<html/i);
+    const htmlEnd = content.lastIndexOf("</html>");
+    if (htmlStart !== -1 && htmlEnd !== -1) {
+        return content.substring(htmlStart, htmlEnd + 7).trim();
+    }
+    // Fallback: strip markdown code blocks
+    return content
+        .replace(/```[a-z]*\n?/gi, '')
+        .replace(/```$/g, '')
+        .trim();
+};
 //controller function to make revision
 export const makeRevision = async (req, res) => {
     const userId = req.userId;
@@ -12,7 +27,7 @@ export const makeRevision = async (req, res) => {
         if (!userId || !user) {
             return res.status(401).json({ message: 'Unauthorized' });
         }
-        if (user.credits < 5) {
+        if (user.credits < 2) {
             return res.status(403).json({ message: 'add more credits to make changes' });
         }
         if (!message || message.trim() == '') {
@@ -34,11 +49,15 @@ export const makeRevision = async (req, res) => {
         });
         await prisma.user.update({
             where: { id: userId },
-            data: { credits: { decrement: 5 } }
+            data: { credits: { decrement: 2 } }
         });
         //enhance user prompt
-        const promptEnhanceResponse = await openai.chat.completions.create({
-            model: process.env.AI_MODEL || 'google/gemma-4-31b-it:free',
+        console.log("AI prompt enhancement for revision request started.");
+        console.log("Model requested:", process.env.AI_MODEL || 'kwaipilot/kat-coder-pro-v2');
+        console.log("Revision prompt payload:", message);
+        const promptEnhanceResponse = await createChatCompletionWithRetry({
+            model: process.env.AI_MODEL || 'kwaipilot/kat-coder-pro-v2',
+            max_tokens: 1500,
             messages: [
                 {
                     role: 'system',
@@ -59,6 +78,7 @@ export const makeRevision = async (req, res) => {
                 }
             ]
         });
+        console.log("AI prompt enhancement for revision response received:", JSON.stringify(promptEnhanceResponse, null, 2));
         const enhancedPrompt = promptEnhanceResponse.choices[0].message.content;
         await prisma.conversation.create({
             data: {
@@ -75,8 +95,16 @@ export const makeRevision = async (req, res) => {
             }
         });
         //generate website code 
-        const codeGenerationResponse = await openai.chat.completions.create({
-            model: process.env.AI_MODEL || 'google/gemma-4-31b-it:free',
+        console.log("AI code generation for revision request started.");
+        console.log("Model requested:", process.env.AI_MODEL || 'kwaipilot/kat-coder-pro-v2');
+        console.log("Enhanced prompt revision payload:", enhancedPrompt);
+        // Calculate max_tokens dynamically: scale based on prompt length, capped between 1500 and 2500
+        const promptLength = (enhancedPrompt || '').length;
+        const dynamicMaxTokens = Math.min(2500, Math.max(1500, 1500 + Math.floor(promptLength * 0.5)));
+        console.log(`[Dynamic Token Allocation] Calculated max_tokens: ${dynamicMaxTokens} for prompt of length ${promptLength}`);
+        const codeGenerationResponse = await createChatCompletionWithRetry({
+            model: process.env.AI_MODEL || 'kwaipilot/kat-coder-pro-v2',
+            max_tokens: dynamicMaxTokens,
             messages: [
                 {
                     role: 'system',
@@ -99,8 +127,13 @@ export const makeRevision = async (req, res) => {
                 }
             ]
         });
-        const code = codeGenerationResponse.choices[0].message.content || '';
-        if (!code) {
+        console.log("=== RAW AI RESPONSE (REVISION) ===");
+        console.log(codeGenerationResponse?.choices?.[0]?.message?.content || "(null/undefined)");
+        const rawCode = codeGenerationResponse?.choices?.[0]?.message?.content || '';
+        const processedCode = extractHTML(rawCode);
+        console.log("=== PROCESSED/PARSING OUTPUT (REVISION) ===");
+        console.log(processedCode);
+        if (!processedCode) {
             await prisma.conversation.create({
                 data: {
                     role: 'assistant',
@@ -110,19 +143,19 @@ export const makeRevision = async (req, res) => {
             });
             await prisma.user.update({
                 where: { id: userId },
-                data: { credits: { increment: 5 } }
+                data: { credits: { increment: 2 } }
             });
             return;
         }
         const version = await prisma.version.create({
             data: {
-                code: code.replace(/```[a-z]*\n?/gi, '')
-                    .replace(/```$/g, '')
-                    .trim(),
+                code: processedCode,
                 description: 'changes made',
                 projectId
             }
         });
+        console.log("=== DATABASE-STORED CONTENT (REVISION VERSION ID: " + version.id + ") ===");
+        console.log(version.code);
         await prisma.conversation.create({
             data: {
                 role: 'assistant',
@@ -130,21 +163,21 @@ export const makeRevision = async (req, res) => {
                 projectId
             }
         });
-        await prisma.websiteProject.update({
+        const updatedProject = await prisma.websiteProject.update({
             where: { id: projectId },
             data: {
-                current_code: code.replace(/```[a-z]*\n?/gi, '')
-                    .replace(/```$/g, '')
-                    .trim(),
+                current_code: processedCode,
                 current_version_index: version.id
             }
         });
+        console.log("=== DATABASE-STORED CONTENT (REVISION PROJECT ID: " + updatedProject.id + ") ===");
+        console.log(updatedProject.current_code);
         res.json({ message: 'Changes made successfully' });
     }
     catch (error) {
         await prisma.user.update({
             where: { id: userId },
-            data: { credits: { increment: 5 } }
+            data: { credits: { increment: 2 } }
         });
         console.log(error.code || error.message);
         res.status(500).json({ message: error.message });
